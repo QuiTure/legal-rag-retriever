@@ -33,12 +33,15 @@ async def retrieval(request: RetrievalRequest, authorization: str = Header(None)
     if request.knowledge_id != KNOWLEDGE_ID:
         raise HTTPException(status_code=404, detail={"error_code": 2001, "error_msg": "知识库不存在"})
 
-    # 调用你的查询（正确）
-    your_results = db_query.search(request.query, request.retrieval_setting.top_k)
+    # 将从 Dify 获取的参数以","切分成数组分别查询
+    query_list = [q.strip() for q in request.query.split(",") if q.strip()]
+    results = []
+    for q in query_list:
+         results.extend(db_query.search(q, request.retrieval_setting.top_k))
 
     # 格式转换（修复了报错问题）
     dify_records = []
-    for item in your_results:
+    for item in results:
         # 修复1：score 给默认值 0.9，防止None报错
         score = item.get("score", 0.9)
         # 修复2：安全取值
