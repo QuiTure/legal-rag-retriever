@@ -1,0 +1,13 @@
+# 核心计算与网络请求
+numpy>=1.24.0
+requests>=2.31.0
+
+# 向量模型支持
+langchain-openai>=0.1.0
+
+# API 接口框架及依赖
+fastapi>=0.100.0
+pydantic>=2.0.0
+
+# 运行 FastAPI 推荐的 ASGI 服务器（虽然代码里没写，但运行 dify_api.py 需要）
+uvicorn>=0.34.0
