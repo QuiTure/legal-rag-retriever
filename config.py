@@ -1,7 +1,0 @@
-EMBEDDING_API_KEY = "sk-zshdcjvfqfyitlrzjzfnzxttefoktrowbukuuagnnuyjuywe"
-EMBEDDING_BASE_URL = "https://api.siliconflow.cn/v1"
-EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
-
-RERANKER_API_KEY = "sk-zshdcjvfqfyitlrzjzfnzxttefoktrowbukuuagnnuyjuywe"
-RERANKER_BASE_URL = "https://api.siliconflow.cn/v1"
-RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
