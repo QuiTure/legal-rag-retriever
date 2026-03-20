@@ -1,32 +1,40 @@
 import json
 import re
-import numpy as np
+import logging
 import requests
+import numpy as np
+import concurrent.futures
 from pathlib import Path
+from typing import List, Dict, Any, Tuple
+
 from langchain_openai import OpenAIEmbeddings
 
+# 假设 config 模块已正确配置
 import config
+
+logger = logging.getLogger(__name__)
 
 
 class LegalProvisionSearcher:
+    """
+    法律条文检索器。
+    采用两阶段检索架构：
+    1. 初排 (Recall): 基于本地 Numpy 矩阵计算向量余弦相似度，进行快速召回。
+    2. 精排 (Rerank): 多线程调用外部 Reranker API 对初排结果进行打分重排。
+    """
+
     def __init__(
             self,
             json_path: str,
-            api_key=config.EMBEDDING_API_KEY,
+            api_key: str = config.EMBEDDING_API_KEY,
             base_url: str = config.EMBEDDING_BASE_URL,
             model_name: str = config.EMBEDDING_MODEL_NAME,
             dimensions: int = 1024,
             reranker_api_key: str = config.RERANKER_API_KEY,
             reranker_base_url: str = config.RERANKER_BASE_URL,
             reranker_model_name: str = config.RERANKER_MODEL_NAME
-    ):
-        """
-        初始化法律条文搜索器 (包含 Embedding 和 Rerank)
-        """
+    ) -> None:
         self.json_path = json_path
-        self.api_key = api_key
-        self.base_url = base_url
-        self.model_name = model_name
         self.dimensions = dimensions
 
         # Reranker 参数
@@ -34,65 +42,77 @@ class LegalProvisionSearcher:
         self.reranker_base_url = reranker_base_url
         self.reranker_model_name = reranker_model_name
 
+        # 初始化 HTTP Session 以复用底层 TCP 连接，提升并发请求性能
+        self.http_session = requests.Session()
+        self.http_session.headers.update({
+            "Authorization": f"Bearer {self.reranker_api_key}",
+            "Content-Type": "application/json"
+        })
+
         # 初始化 Embedding 客户端
         self.embeddings = OpenAIEmbeddings(
-            base_url=self.base_url,
-            api_key=self.api_key,
-            model=self.model_name,
+            base_url=base_url,
+            api_key=api_key,
+            model=model_name,
             dimensions=self.dimensions
         )
 
-        self.data = self._load_data()
+        # 加载数据并构建向量矩阵
+        self.data, self.doc_vectors, self.doc_norms = self._load_and_build_index()
 
-    def _load_data(self):
-        """加载 JSON 数据"""
-        if not Path(self.json_path).exists():
-            raise FileNotFoundError(f"文件未找到: {self.json_path}")
+    def _load_and_build_index(self) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+        """加载 JSON 数据，并将向量转换为 Numpy 矩阵供快速检索"""
+        path = Path(self.json_path)
+        if not path.exists():
+            raise FileNotFoundError(f"数据文件未找到: {self.json_path}")
 
-        with open(self.json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        with open(path, 'r', encoding='utf-8') as f:
+            try:
+                raw_data = json.load(f)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"JSON 解析失败: {e}")
 
-        if not isinstance(data, list):
+        if not isinstance(raw_data, list):
             raise ValueError("数据格式错误：期望为扁平化的列表 (List[dict])。")
 
-        return data
+        valid_data = []
+        vectors = []
 
-    def _cosine_similarity(self, vec1, vec2):
-        """计算余弦相似度"""
-        if not vec1 or not vec2:
-            return 0.0
+        for item in raw_data:
+            vec = item.get("向量")
+            if vec and isinstance(vec, list) and len(vec) == self.dimensions:
+                valid_data.append(item)
+                vectors.append(vec)
 
-        v1 = np.array(vec1)
-        v2 = np.array(vec2)
+        if not valid_data:
+            logger.warning(f"文件 {self.json_path} 中未找到符合维度要求的向量数据。")
 
-        norm1 = np.linalg.norm(v1)
-        norm2 = np.linalg.norm(v2)
+        # 转换为 Float32 矩阵以加速计算
+        doc_vectors = np.array(vectors, dtype=np.float32)
 
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        return np.dot(v1, v2) / (norm1 * norm2)
+        # 预计算所有法条向量的模长 (Norm)
+        if doc_vectors.size > 0:
+            doc_norms = np.linalg.norm(doc_vectors, axis=1)
+            doc_norms[doc_norms == 0] = 1e-9  # 防止除以 0
+        else:
+            doc_norms = np.array([])
 
-    def _format_provision(self, item: dict) -> str:
-        """根据结构化数据的字段拼接法条路径"""
+        logger.info(f"成功加载 {len(valid_data)} 条法条向量数据。")
+        return valid_data, doc_vectors, doc_norms
+
+    def _format_provision(self, item: Dict[str, Any]) -> str:
+        """格式化法条名称"""
         keys = ["法律", "编", "编名", "章", "章名", "节", "节名", "条", "款", "项"]
-        # 按照指定的键提取，并过滤掉空值
         parts = [str(item.get(k, "")) for k in keys if item.get(k)]
         return " ".join(parts).strip()
 
-    def _rerank(self, query: str, candidates: list, top_k: int):
-        """
-        调用 Reranker 接口进行精确重排序
-        """
+    def _rerank(self, query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """调用 Reranker 接口对候选文档进行重排"""
         if not candidates:
             return []
 
-        url = self.reranker_base_url.rstrip("/") + "/rerank"
-        headers = {
-            "Authorization": f"Bearer {self.reranker_api_key}",
-            "Content-Type": "application/json"
-        }
-
-        documents = [c["content"] for c in candidates]
+        url = f"{self.reranker_base_url.rstrip('/')}/rerank"
+        documents = [c.get("content", "") for c in candidates]
 
         payload = {
             "model": self.reranker_model_name,
@@ -102,7 +122,7 @@ class LegalProvisionSearcher:
         }
 
         try:
-            response = requests.post(url, json=payload, headers=headers)
+            response = self.http_session.post(url, json=payload, timeout=10)
             response.raise_for_status()
             res_data = response.json()
 
@@ -110,78 +130,101 @@ class LegalProvisionSearcher:
             reranked_candidates = []
 
             for r in results:
-                idx = r["index"]
-                score = r["relevance_score"]
-                candidate = candidates[idx].copy()
-                candidate["score"] = score  # 替换为精排分数
-                reranked_candidates.append(candidate)
+                idx = r.get("index", 0)
+                if idx < len(candidates):
+                    candidate = candidates[idx].copy()
+                    candidate["score"] = r.get("relevance_score", 0.0)
+                    reranked_candidates.append(candidate)
 
             reranked_candidates.sort(key=lambda x: x["score"], reverse=True)
             return reranked_candidates
 
-        except Exception as e:
-            print(f"Rerank 步骤失败: {e}。将退回使用初排向量分数。")
+        except requests.RequestException as e:
+            logger.error(f"Rerank 步骤请求失败: {e}。将回退使用初排向量分数。")
             return candidates[:top_k]
 
-    def search(self, query: str, top_k: int = 5, retrieve_k: int = 50) -> list:
+    def search(self, query: str, top_k: int = 5, retrieve_k: int = 50) -> List[Dict[str, Any]]:
         """
-        执行检索，并返回格式化后的结果列表。对每个关键词分别进行查找。
+        执行多关键词混合搜索。
 
-        :param query: 包含多个关键词的搜索字符串，以中/英文逗号分割
-        :param top_k: 每个关键词独立返回的结果数量
-        :param retrieve_k: 向量初排召回的候选数量
-        :return: 包含法条和内容字典的数组 (已合并去重)
+        Args:
+            query (str): 搜索语句（支持逗号分隔多个关键词）。
+            top_k (int): 最终返回的条目数量。
+            retrieve_k (int): 每个关键词在初排阶段召回的数量。
+
+        Returns:
+            List[Dict]: 检索并重排后的法条结果列表。
         """
+        if self.doc_vectors.size == 0:
+            return []
+
         # 1. 切分字符串获取关键词列表
         keywords = [k.strip() for k in re.split(r'[,，]', query) if k.strip()]
-
         if not keywords:
             return []
 
-        # 用于存储所有关键词召回的最终结果，使用法条名称作为 key 进行去重
-        merged_results = {}
+        # ================= 第一阶段：批量并行 Embedding & 矩阵运算 (召回) =================
+        try:
+            query_vecs = self.embeddings.embed_documents(keywords)
+            query_matrix = np.array(query_vecs, dtype=np.float32)
+        except Exception as e:
+            logger.error(f"向量化接口调用失败: {e}", exc_info=True)
+            return []
 
-        # 2. 对每个关键词分别进行完整流程的检索
-        for kw in keywords:
-            try:
-                query_vec = self.embeddings.embed_query(kw)
-            except Exception as e:
-                print(f"向量化接口调用失败 (关键词: {kw}): {e}")
-                continue
+        query_norms = np.linalg.norm(query_matrix, axis=1)
+        query_norms[query_norms == 0] = 1e-9
 
-            # 初排 (Embedding)
-            results = []
-            for item in self.data:
-                item_vec = item.get("向量")
-                if item_vec and len(item_vec) > 0:
-                    sim = self._cosine_similarity(query_vec, item_vec)
-                    if sim > 0:
-                        results.append({
-                            "score": sim,
-                            "content": item.get("内容", ""),
-                            "raw_item": item
-                        })
+        # 矩阵乘法快速计算余弦相似度
+        sim_matrix = np.dot(query_matrix, self.doc_vectors.T) / np.outer(query_norms, self.doc_norms)
 
-            results.sort(key=lambda x: x['score'], reverse=True)
-            candidates = results[:retrieve_k]
+        actual_retrieve_k = min(retrieve_k, sim_matrix.shape[1])
+        top_indices = np.argpartition(-sim_matrix, actual_retrieve_k - 1, axis=1)[:, :actual_retrieve_k]
 
-            # 精排 (Rerank)
-            final_results = self._rerank(kw, candidates, top_k)
+        all_candidates = []
+        for i, kw in enumerate(keywords):
+            kw_indices = top_indices[i]
+            sorted_kw_indices = kw_indices[np.argsort(-sim_matrix[i, kw_indices])]
 
-            # 3. 将当前关键词的结果合并到总结果中（含去重逻辑）
-            for res in final_results:
-                provision_name = self._format_provision(res["raw_item"])
+            candidates = [{
+                "score": float(sim_matrix[i, idx]),
+                "content": self.data[idx].get("内容", ""),
+                "raw_item": self.data[idx]
+            } for idx in sorted_kw_indices if float(sim_matrix[i, idx]) > 0]
 
-                # 如果该法条已存在，保留分数最高的那次记录
-                if provision_name not in merged_results or res["score"] > merged_results[provision_name]["相似度"]:
-                    merged_results[provision_name] = {
-                        "法条": provision_name,
-                        "内容": res["content"],
-                        "相似度": res["score"]
-                    }
+            all_candidates.append((kw, candidates))
 
-        # 4. 将合并后的字典转为列表，并按最终的相似度全局降序排列
+        # ================= 第二阶段：多线程并发 Rerank (精排) =================
+        merged_results: Dict[str, Dict[str, Any]] = {}
+
+        def process_rerank(kw_and_cands: Tuple[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+            kw, cands = kw_and_cands
+            return self._rerank(kw, cands, top_k)
+
+        max_workers = min(10, len(keywords))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_kw = {executor.submit(process_rerank, item): item[0] for item in all_candidates}
+
+            for future in concurrent.futures.as_completed(future_to_kw):
+                try:
+                    final_results = future.result()
+                    # 去重与合并逻辑
+                    for res in final_results:
+                        provision_name = self._format_provision(res["raw_item"])
+                        current_score = res["score"]
+
+                        if provision_name not in merged_results or current_score > merged_results[provision_name][
+                            "相似度"]:
+                            merged_results[provision_name] = {
+                                "法条": provision_name,
+                                "内容": res["content"],
+                                "相似度": current_score
+                            }
+                except Exception as e:
+                    kw = future_to_kw[future]
+                    logger.error(f"处理关键词 '{kw}' 的精排任务时发生异常: {e}", exc_info=True)
+
+        # 全局按分数降序排列并截取 Top-K
         output = list(merged_results.values())
         output.sort(key=lambda x: x["相似度"], reverse=True)
 
-        return output
+        return output[:top_k]
