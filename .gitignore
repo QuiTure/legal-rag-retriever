@@ -17,3 +17,6 @@ __pycache__/
 
 # Git 版本
 .git/
+
+# 配置文件
+config.py
