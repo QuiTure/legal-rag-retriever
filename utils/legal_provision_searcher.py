@@ -4,6 +4,7 @@ import logging
 import requests
 import numpy as np
 import concurrent.futures
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from collections import OrderedDict
@@ -38,7 +39,7 @@ class LegalProvisionSearcher:
             reranker_base_url: Optional[str] = None,
             reranker_model_name: Optional[str] = None,
             db_dir: Optional[Path] = None,
-            max_cache_size: int = 5  # 新增：最大缓存文件数，防止 OOM
+            max_cache_size: int = 5  # 最大缓存文件数，防止 OOM
     ) -> None:
         # 懒加载配置，避免导入模块时引发潜在的循环依赖
         self.embedding_dimensions = embedding_dimensions or config.EMBEDDING_DIMENSIONS
@@ -87,6 +88,7 @@ class LegalProvisionSearcher:
         if not json_path.exists():
             raise FileNotFoundError(f"数据文件未找到: {json_path}")
 
+        start_time = time.time()
         with open(json_path, 'r', encoding='utf-8') as f:
             try:
                 raw_data = json.load(f)
@@ -118,7 +120,7 @@ class LegalProvisionSearcher:
         else:
             doc_norms = np.array([])
 
-        logger.info(f"成功加载 {json_path.name}: {len(valid_data)} 条法条向量数据。")
+        logger.info(f"成功加载 {json_path.name}: {len(valid_data)} 条向量数据, 耗时 {time.time() - start_time:.2f}s。")
         return valid_data, doc_vectors, doc_norms
 
     def _get_cached_law(self, law_file: str) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
@@ -160,21 +162,23 @@ class LegalProvisionSearcher:
 
         user_prompt = f"可用的法律文件：\n{json.dumps(available_files, ensure_ascii=False)}\n\n用户的查询：\n{query}"
 
+        start_time = time.time()
         try:
             response = self.model.invoke([
                 SystemMessage(content=system_prompt),
                 HumanMessage(content=user_prompt)
             ])
+            cost_time = time.time() - start_time
+
             result_json = json.loads(response.content)
             selected_laws = result_json.get("laws", [])
 
             # 过滤掉不在列表中的幻觉文件名
             valid_selected = [law for law in selected_laws if law in available_files]
-            logger.info(f"LLM 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
+            logger.info(f"[LLM路由] 耗�� {cost_time:.2f}s, 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
             return valid_selected
         except Exception as e:
-            logger.error(f"调用 LLM 筛选法律文件失败: {e}", exc_info=True)
-            # 修复：发生异常时直接返回空列表，绝对不能返回 available_files，否则会瞬间触发所有数据加载导致 OOM
+            logger.error(f"[LLM路由] 筛选法律文件失败: {e}", exc_info=True)
             return []
 
     def _format_provision(self, item: Dict[str, Any]) -> str:
@@ -199,7 +203,6 @@ class LegalProvisionSearcher:
         }
 
         try:
-            # 增加超时容忍时间，避免由于文本略长导致直接失败
             response = self.http_session.post(url, json=payload, timeout=15)
             response.raise_for_status()
             res_data = response.json()
@@ -223,9 +226,13 @@ class LegalProvisionSearcher:
 
     def search(self, query: str, top_k: int = 10, retrieve_k: int = 50, score: float = 0.0) -> List[Dict[str, Any]]:
         """执行多关键词混合搜索"""
+        total_start = time.time()
+        logger.info(f"开始执行检索管道，Query: '{query}'")
+
+        # 1. LLM 路由筛选文件
         selected_law_files = self._get_relevant_laws_from_llm(query)
         if not selected_law_files:
-            logger.warning("没有匹配到相关的法律文件。")
+            logger.warning("没有匹配到相关的法律文件，检索结束。")
             return []
 
         combined_data = []
@@ -251,16 +258,20 @@ class LegalProvisionSearcher:
         if not keywords:
             return []
 
+        # 2. 向量化阶段
+        embed_start = time.time()
         try:
             query_vecs = self.embeddings.embed_documents(keywords)
             query_matrix = np.array(query_vecs, dtype=np.float32)
+            logger.info(f"[向量化] 耗时 {time.time() - embed_start:.2f}s, 成功生成 {len(keywords)} 个关键词向量。")
         except Exception as e:
-            logger.error(f"向量化接口调用失败: {e}", exc_info=True)
+            logger.error(f"[向量化] 接口调用失败: {e}", exc_info=True)
             return []
 
         query_norms = np.linalg.norm(query_matrix, axis=1)
         query_norms[query_norms == 0] = 1e-9
 
+        # 余弦相似度计算 (初排)
         sim_matrix = np.dot(query_matrix, doc_vectors.T) / np.outer(query_norms, doc_norms)
 
         actual_retrieve_k = min(retrieve_k, sim_matrix.shape[1])
@@ -285,6 +296,8 @@ class LegalProvisionSearcher:
             kw, cands = kw_and_cands
             return self._rerank(kw, cands, top_k)
 
+        # 3. 精排阶段 (多线程)
+        rerank_start = time.time()
         max_workers = min(10, len(keywords))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_kw = {executor.submit(process_rerank, item): item[0] for item in all_candidates}
@@ -299,7 +312,8 @@ class LegalProvisionSearcher:
                         if current_score < score:
                             continue
 
-                        if provision_name not in merged_results or current_score > merged_results[provision_name]["相似度"]:
+                        if provision_name not in merged_results or current_score > merged_results[provision_name][
+                            "相似度"]:
                             merged_results[provision_name] = {
                                 "法条": provision_name,
                                 "内容": res["content"],
@@ -309,7 +323,12 @@ class LegalProvisionSearcher:
                     kw = future_to_kw[future]
                     logger.error(f"处理关键词 '{kw}' 的精排任务时发生异常: {e}", exc_info=True)
 
+        logger.info(f"[精排阶段] 多线程 Rerank 耗时 {time.time() - rerank_start:.2f}s。")
+
+        # 结果排序截取
         output = list(merged_results.values())
         output.sort(key=lambda x: x["相似度"], reverse=True)
+        final_output = output[:top_k]
 
-        return output[:top_k]
+        logger.info(f"检索管道执行完毕，总耗时 {time.time() - total_start:.2f}s，最终返回 {len(final_output)} 条结果。")
+        return final_output

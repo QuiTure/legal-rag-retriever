@@ -1,17 +1,44 @@
+import os
 import sys
 import logging
+from logging.handlers import RotatingFileHandler
 from utils.legal_provision_searcher import LegalProvisionSearcher
 
 
 def setup_logging():
-    """配置基础日志输出，以便查看底层搜索器的加载状态"""
+    """配置全局日志输出（与 Server 端保持一致的轮转日志与格式）"""
+    LOG_DIR = "logs"
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # 定义统一的日志格式
+    log_format = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_format)
+
+    # 文件处理器（按大小轮转，最大 10MB，保留 5 个备份）
+    file_handler = RotatingFileHandler(
+        filename=os.path.join(LOG_DIR, "cli_app.log"),  # 命名为 cli_app.log 以区分 server 的 app.log
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8"
+    )
+    file_handler.setFormatter(log_format)
+
+    # 配置根日志记录器 (Root Logger)
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
+        handlers=[console_handler, file_handler]
     )
-    # 屏蔽 requests/urllib3 的底层 DEBUG/INFO 噪音
+
+    # 屏蔽 requests/urllib3/httpx 的底层 DEBUG/INFO 噪音 (LangChain 底层使用 httpx)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def main():
@@ -21,12 +48,11 @@ def main():
     print("      法律条文智能搜索系统 (支持多关键词组合检索)")
     print("=" * 60)
 
-    # 1. 初始化搜索器 (不再需要手动传入 json_path)
+    # 1. 初始化搜索器
     try:
         print("\n正在初始化搜索器...")
         print("(系统将在您首次查询时，自动调用大模型从本地法条库寻找并加载适用的法律文件)\n")
         searcher = LegalProvisionSearcher()
-        print("初始化成功！")
     except Exception as e:
         print(f"\n[错误] 初始化失败: {e}")
         sys.exit(1)
@@ -55,10 +81,10 @@ def main():
 
             # 4. 结构化输出结果
             if not results:
-                print("未找到相关的法律条文。")
+                print("\n未找到相关的法律条文。")
                 continue
 
-            print("=" * 50)
+            print("\n" + "=" * 50)
             print(f" 检索完毕，共找到 {len(results)} 条相关法条 (按相似度降序排列)")
             print("=" * 50)
 
