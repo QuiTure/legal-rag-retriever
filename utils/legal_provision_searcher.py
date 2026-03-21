@@ -175,7 +175,7 @@ class LegalProvisionSearcher:
 
             # 过滤掉不在列表中的幻觉文件名
             valid_selected = [law for law in selected_laws if law in available_files]
-            logger.info(f"[LLM路由] 耗�� {cost_time:.2f}s, 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
+            logger.info(f"[LLM路由] 耗时 {cost_time:.2f}s, 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
             return valid_selected
         except Exception as e:
             logger.error(f"[LLM路由] 筛选法律文件失败: {e}", exc_info=True)
