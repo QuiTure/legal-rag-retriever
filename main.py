@@ -21,16 +21,12 @@ def main():
     print("      法律条文智能搜索系统 (支持多关键词组合检索)")
     print("=" * 60)
 
-    # 1. 获取文件路径并初始化搜索器
-    default_path = "database/legal_provisions/中华人民共和国刑法.json"
-    json_path = input(f"请输入向量化JSON文件路径 (默认: {default_path}): ").strip()
-    if not json_path:
-        json_path = default_path
-
+    # 1. 初始化搜索器 (不再需要手动传入 json_path)
     try:
-        print(f"\n正在加载数据并初始化搜索器 (构建向量矩阵加速中): {json_path} ...")
-        searcher = LegalProvisionSearcher(json_path=json_path)
-        print("初始化成功！\n")
+        print("\n正在初始化搜索器...")
+        print("(系统将在您首次查询时，自动调用大模型从本地法条库寻找并加载适用的法律文件)\n")
+        searcher = LegalProvisionSearcher()
+        print("初始化成功！")
     except Exception as e:
         print(f"\n[错误] 初始化失败: {e}")
         sys.exit(1)
@@ -38,7 +34,7 @@ def main():
     # 2. 交互式主循环
     while True:
         try:
-            print("*" * 60)
+            print("\n" + "*" * 60)
             # 提示用户可以输入多个用逗号分割的关键词
             query = input("请输入搜索关键词 (支持多个，用中/英文逗号分割，输入 'q' 退出): ").strip()
 
@@ -52,10 +48,10 @@ def main():
             top_k_str = input("请输入期望返回的最终结果数量 (默认 5): ").strip()
             top_k = int(top_k_str) if top_k_str.isdigit() else 5
 
-            print(f"\n正在快速检索 '{query}'，进行批量并发重排中，请稍候...\n")
+            print(f"\n正在分析请求 '{query}'，进行动态路由、快速检索与并发重排，请稍候...\n")
 
             # 3. 调用封装好的搜索器
-            results = searcher.search(query=query, top_k=top_k)
+            results = searcher.search(query=query, top_k=top_k, score=0.5)
 
             # 4. 结构化输出结果
             if not results:

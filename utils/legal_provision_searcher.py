@@ -5,11 +5,12 @@ import requests
 import numpy as np
 import concurrent.futures
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
+from collections import OrderedDict
 
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
-# 假设 config 模块已正确配置
 import config
 
 logger = logging.getLogger(__name__)
@@ -18,55 +19,75 @@ logger = logging.getLogger(__name__)
 class LegalProvisionSearcher:
     """
     法律条文检索器。
-    采用两阶段检索架构：
+    采用三阶段架构：
+    0. 路由 (Routing): 利用 LLM 动态从给定的本地法条库中选择适用的法律文件并加载。
     1. 初排 (Recall): 基于本地 Numpy 矩阵计算向量余弦相似度，进行快速召回。
     2. 精排 (Rerank): 多线程调用外部 Reranker API 对初排结果进行打分重排。
     """
 
     def __init__(
             self,
-            json_path: str,
-            api_key: str = config.EMBEDDING_API_KEY,
-            base_url: str = config.EMBEDDING_BASE_URL,
-            model_name: str = config.EMBEDDING_MODEL_NAME,
-            dimensions: int = 1024,
-            reranker_api_key: str = config.RERANKER_API_KEY,
-            reranker_base_url: str = config.RERANKER_BASE_URL,
-            reranker_model_name: str = config.RERANKER_MODEL_NAME
+            llm_api_key: Optional[str] = None,
+            llm_base_url: Optional[str] = None,
+            llm_model_name: Optional[str] = None,
+            embedding_api_key: Optional[str] = None,
+            embedding_base_url: Optional[str] = None,
+            embedding_model_name: Optional[str] = None,
+            embedding_dimensions: Optional[int] = None,
+            reranker_api_key: Optional[str] = None,
+            reranker_base_url: Optional[str] = None,
+            reranker_model_name: Optional[str] = None,
+            db_dir: Optional[Path] = None,
+            max_cache_size: int = 5  # 新增：最大缓存文件数，防止 OOM
     ) -> None:
-        self.json_path = json_path
-        self.dimensions = dimensions
+        # 懒加载配置，避免导入模块时引发潜在的循环依赖
+        self.embedding_dimensions = embedding_dimensions or config.EMBEDDING_DIMENSIONS
+        self.db_dir = db_dir or (Path(__file__).resolve().parent.parent / "database" / "legal_provisions")
+        self.max_cache_size = max_cache_size
+
+        # 缓存已加载的法律文件数据。使用 OrderedDict 实现 LRU (最近最少使用) 缓存剔除
+        # 结构: {filename: (valid_data, doc_vectors, doc_norms)}
+        self.loaded_laws_cache: OrderedDict[str, Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]] = OrderedDict()
 
         # Reranker 参数
-        self.reranker_api_key = reranker_api_key
-        self.reranker_base_url = reranker_base_url
-        self.reranker_model_name = reranker_model_name
+        self.reranker_api_key = reranker_api_key or config.RERANKER_API_KEY
+        self.reranker_base_url = reranker_base_url or config.RERANKER_BASE_URL
+        self.reranker_model_name = reranker_model_name or config.RERANKER_MODEL_NAME
 
-        # 初始化 HTTP Session 以复用底层 TCP 连接，提升并发请求性能
+        # 初始化 HTTP Session 以复用底层 TCP 连接
         self.http_session = requests.Session()
         self.http_session.headers.update({
             "Authorization": f"Bearer {self.reranker_api_key}",
             "Content-Type": "application/json"
         })
 
-        # 初始化 Embedding 客户端
-        self.embeddings = OpenAIEmbeddings(
-            base_url=base_url,
-            api_key=api_key,
-            model=model_name,
-            dimensions=self.dimensions
+        # 初始化 llm 客户端
+        self.model = ChatOpenAI(
+            base_url=llm_base_url or config.LLM_BASE_URL,
+            api_key=llm_api_key or config.LLM_API_KEY,
+            model=llm_model_name or config.LLM_MODEL_NAME,
+            temperature=0,
+            top_p=0.7,
+            seed=42,
+            model_kwargs={
+                "response_format": {"type": "json_object"}
+            }
         )
 
-        # 加载数据并构建向量矩阵
-        self.data, self.doc_vectors, self.doc_norms = self._load_and_build_index()
+        # 初始化 Embedding 客户端
+        self.embeddings = OpenAIEmbeddings(
+            base_url=embedding_base_url or config.EMBEDDING_BASE_URL,
+            api_key=embedding_api_key or config.EMBEDDING_API_KEY,
+            model=embedding_model_name or config.EMBEDDING_MODEL_NAME,
+            dimensions=self.embedding_dimensions
+        )
 
-    def _load_and_build_index(self) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
-        """加载 JSON 数据，并将向量转换为 Numpy 矩阵供快速检索"""
-        path = Path(self.json_path)
-        if not path.exists():
-            raise FileNotFoundError(f"数据文件未找到: {self.json_path}")
+    def _load_and_build_index(self, json_path: Path) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+        """加载指定的 JSON 数据，并将向量转换为 Numpy 矩阵供快速检索"""
+        if not json_path.exists():
+            raise FileNotFoundError(f"数据文件未找到: {json_path}")
 
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(json_path, 'r', encoding='utf-8') as f:
             try:
                 raw_data = json.load(f)
             except json.JSONDecodeError as e:
@@ -80,12 +101,12 @@ class LegalProvisionSearcher:
 
         for item in raw_data:
             vec = item.get("向量")
-            if vec and isinstance(vec, list) and len(vec) == self.dimensions:
+            if vec and isinstance(vec, list) and len(vec) == self.embedding_dimensions:
                 valid_data.append(item)
                 vectors.append(vec)
 
         if not valid_data:
-            logger.warning(f"文件 {self.json_path} 中未找到符合维度要求的向量数据。")
+            logger.warning(f"文件 {json_path} 中未找到符合维度要求的向量数据。")
 
         # 转换为 Float32 矩阵以加速计算
         doc_vectors = np.array(vectors, dtype=np.float32)
@@ -97,8 +118,64 @@ class LegalProvisionSearcher:
         else:
             doc_norms = np.array([])
 
-        logger.info(f"成功加载 {len(valid_data)} 条法条向量数据。")
+        logger.info(f"成功加载 {json_path.name}: {len(valid_data)} 条法条向量数据。")
         return valid_data, doc_vectors, doc_norms
+
+    def _get_cached_law(self, law_file: str) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
+        """带 LRU 剔除机制的缓存读取"""
+        if law_file in self.loaded_laws_cache:
+            # 命中缓存，将其移到末尾（标记为最近使用）
+            self.loaded_laws_cache.move_to_end(law_file)
+            return self.loaded_laws_cache[law_file]
+
+        # 未命中缓存，进行加载
+        law_path = self.db_dir / law_file
+        data = self._load_and_build_index(law_path)
+
+        self.loaded_laws_cache[law_file] = data
+        self.loaded_laws_cache.move_to_end(law_file)
+
+        # 如果超出了最大缓存限制，弹出最久未使用的文件以释放内存
+        if len(self.loaded_laws_cache) > self.max_cache_size:
+            evicted = self.loaded_laws_cache.popitem(last=False)
+            logger.info(f"达到缓存上限，已释放最早加载的法律文件: {evicted[0]}")
+
+        return data
+
+    def _get_relevant_laws_from_llm(self, query: str) -> List[str]:
+        """调用大模型，根据查询内容动态选择可能相关的法条文件"""
+        if not self.db_dir.exists():
+            logger.warning(f"数据库目录不存在: {self.db_dir}")
+            return []
+
+        available_files = [f.name for f in self.db_dir.glob("*.json")]
+        if not available_files:
+            return []
+
+        system_prompt = (
+            "你是一个法律助理。我将提供一组可用的法律文件名以及用户的查询请求。"
+            "请根据用户的查询，从列表中选出所有可能适用的法律文件名。\n"
+            "请必须返回 JSON 格式数据，包含一个键 'laws'，其值为你挑选的文件名列表（精确匹配我提供的文件名）。"
+        )
+
+        user_prompt = f"可用的法律文件：\n{json.dumps(available_files, ensure_ascii=False)}\n\n用户的查询：\n{query}"
+
+        try:
+            response = self.model.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt)
+            ])
+            result_json = json.loads(response.content)
+            selected_laws = result_json.get("laws", [])
+
+            # 过滤掉不在列表中的幻觉文件名
+            valid_selected = [law for law in selected_laws if law in available_files]
+            logger.info(f"LLM 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
+            return valid_selected
+        except Exception as e:
+            logger.error(f"调用 LLM 筛选法律文件失败: {e}", exc_info=True)
+            # 修复：发生异常时直接返回空列表，绝对不能返回 available_files，否则会瞬间触发所有数据加载导致 OOM
+            return []
 
     def _format_provision(self, item: Dict[str, Any]) -> str:
         """格式化法条名称"""
@@ -122,7 +199,8 @@ class LegalProvisionSearcher:
         }
 
         try:
-            response = self.http_session.post(url, json=payload, timeout=10)
+            # 增加超时容忍时间，避免由于文本略长导致直接失败
+            response = self.http_session.post(url, json=payload, timeout=15)
             response.raise_for_status()
             res_data = response.json()
 
@@ -143,27 +221,36 @@ class LegalProvisionSearcher:
             logger.error(f"Rerank 步骤请求失败: {e}。将回退使用初排向量分数。")
             return candidates[:top_k]
 
-    def search(self, query: str, top_k: int = 5, retrieve_k: int = 50) -> List[Dict[str, Any]]:
-        """
-        执行多关键词混合搜索。
-
-        Args:
-            query (str): 搜索语句（支持逗号分隔多个关键词）。
-            top_k (int): 最终返回的条目数量。
-            retrieve_k (int): 每个关键词在初排阶段召回的数量。
-
-        Returns:
-            List[Dict]: 检索并重排后的法条结果列表。
-        """
-        if self.doc_vectors.size == 0:
+    def search(self, query: str, top_k: int = 10, retrieve_k: int = 50, score: float = 0.0) -> List[Dict[str, Any]]:
+        """执行多关键词混合搜索"""
+        selected_law_files = self._get_relevant_laws_from_llm(query)
+        if not selected_law_files:
+            logger.warning("没有匹配到相关的法律文件。")
             return []
 
-        # 1. 切分字符串获取关键词列表
+        combined_data = []
+        combined_vectors_list = []
+        combined_norms_list = []
+
+        # 使用 LRU 缓存加载或获取数据
+        for law_file in selected_law_files:
+            v_data, v_vecs, v_norms = self._get_cached_law(law_file)
+            combined_data.extend(v_data)
+
+            if v_vecs.size > 0:
+                combined_vectors_list.append(v_vecs)
+                combined_norms_list.append(v_norms)
+
+        if not combined_vectors_list:
+            return []
+
+        doc_vectors = np.vstack(combined_vectors_list)
+        doc_norms = np.concatenate(combined_norms_list)
+
         keywords = [k.strip() for k in re.split(r'[,，]', query) if k.strip()]
         if not keywords:
             return []
 
-        # ================= 第一阶段：批量并行 Embedding & 矩阵运算 (召回) =================
         try:
             query_vecs = self.embeddings.embed_documents(keywords)
             query_matrix = np.array(query_vecs, dtype=np.float32)
@@ -174,8 +261,7 @@ class LegalProvisionSearcher:
         query_norms = np.linalg.norm(query_matrix, axis=1)
         query_norms[query_norms == 0] = 1e-9
 
-        # 矩阵乘法快速计算余弦相似度
-        sim_matrix = np.dot(query_matrix, self.doc_vectors.T) / np.outer(query_norms, self.doc_norms)
+        sim_matrix = np.dot(query_matrix, doc_vectors.T) / np.outer(query_norms, doc_norms)
 
         actual_retrieve_k = min(retrieve_k, sim_matrix.shape[1])
         top_indices = np.argpartition(-sim_matrix, actual_retrieve_k - 1, axis=1)[:, :actual_retrieve_k]
@@ -187,13 +273,12 @@ class LegalProvisionSearcher:
 
             candidates = [{
                 "score": float(sim_matrix[i, idx]),
-                "content": self.data[idx].get("内容", ""),
-                "raw_item": self.data[idx]
+                "content": combined_data[idx].get("内容", ""),
+                "raw_item": combined_data[idx]
             } for idx in sorted_kw_indices if float(sim_matrix[i, idx]) > 0]
 
             all_candidates.append((kw, candidates))
 
-        # ================= 第二阶段：多线程并发 Rerank (精排) =================
         merged_results: Dict[str, Dict[str, Any]] = {}
 
         def process_rerank(kw_and_cands: Tuple[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -207,13 +292,14 @@ class LegalProvisionSearcher:
             for future in concurrent.futures.as_completed(future_to_kw):
                 try:
                     final_results = future.result()
-                    # 去重与合并逻辑
                     for res in final_results:
                         provision_name = self._format_provision(res["raw_item"])
                         current_score = res["score"]
 
-                        if provision_name not in merged_results or current_score > merged_results[provision_name][
-                            "相似度"]:
+                        if current_score < score:
+                            continue
+
+                        if provision_name not in merged_results or current_score > merged_results[provision_name]["相似度"]:
                             merged_results[provision_name] = {
                                 "法条": provision_name,
                                 "内容": res["content"],
@@ -223,7 +309,6 @@ class LegalProvisionSearcher:
                     kw = future_to_kw[future]
                     logger.error(f"处理关键词 '{kw}' 的精排任务时发生异常: {e}", exc_info=True)
 
-        # 全局按分数降序排列并截取 Top-K
         output = list(merged_results.values())
         output.sort(key=lambda x: x["相似度"], reverse=True)
 
