@@ -20,3 +20,7 @@ __pycache__/
 
 # 配置文件
 config.py
+
+# 日志文件夹和文件
+logs/
+*.log

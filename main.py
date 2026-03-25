@@ -77,7 +77,7 @@ def main():
             print(f"\n正在分析请求 '{query}'，进行动态路由、快速检索与并发重排，请稍候...\n")
 
             # 3. 调用封装好的搜索器
-            results = searcher.search(query=query, top_k=top_k, score=0.5)
+            results = searcher.search(query=query, top_k=top_k, score=0)
 
             # 4. 结构化输出结果
             if not results:
