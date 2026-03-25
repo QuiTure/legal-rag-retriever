@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 from utils.legal_provision_searcher import LegalProvisionSearcher
-from utils.legal_case_searcher import CaseSearcher
+from utils.legal_case_searcher import LegalCaseSearcher
 
 # ================= 1. 日志全局配置 =================
 LOG_DIR = "logs"
@@ -54,7 +54,7 @@ async def lifespan(app: FastAPI):
         logger.info("法律条文搜索器初始化完成。")
 
         # 法律案例搜索器
-        app.state.case_searcher = CaseSearcher()
+        app.state.case_searcher = LegalCaseSearcher()
         logger.info("法律案例搜索器初始化完成。")
 
     except Exception as e:
@@ -93,7 +93,7 @@ def search(req: SearchRequest, request: Request):
             results = searcher.search(query=req.query, top_k=req.top_k, score=req.score)
 
         elif req.db_type == "legal_cases":
-            searcher: CaseSearcher = request.app.state.case_searcher
+            searcher: LegalCaseSearcher = request.app.state.case_searcher
             results = searcher.search(query=req.query, top_k=req.top_k, score=req.score)
 
         else:

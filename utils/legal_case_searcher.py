@@ -17,7 +17,7 @@ import config
 logger = logging.getLogger(__name__)
 
 
-class CaseSearcher:
+class LegalCaseSearcher:
     """
     法律案例检索器（与 LegalProvisionSearcher 同逻辑样式）：
     0. 路由(Routing): LLM 从本地案例文件中选择相关文件
@@ -341,5 +341,5 @@ class CaseSearcher:
         output.sort(key=lambda x: x["相似度"], reverse=True)
         final_output = output[:top_k]
 
-        logger.info(f"案例检索���成，总耗时 {time.time() - total_start:.2f}s，最终返回 {len(final_output)} 条。")
+        logger.info(f"案例检索成功，总耗时 {time.time() - total_start:.2f}s，最终返回 {len(final_output)} 条。")
         return final_output
