@@ -35,23 +35,40 @@ def setup_logging():
         handlers=[console_handler, file_handler]
     )
 
-    # 屏蔽 requests/urllib3/httpx 的底层 DEBUG/INFO 噪音 (LangChain 底层使用 httpx)
+    # 屏蔽 requests/urllib3/httpx 的底层 DEBUG/INFO 噪音
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
+def _parse_int(value: str, default: int, min_value: int = 1) -> int:
+    """安全解析整数输入"""
+    try:
+        v = int(value.strip())
+        return v if v >= min_value else default
+    except Exception:
+        return default
+
+
+def _parse_float(value: str, default: float) -> float:
+    """安全解析浮点输入"""
+    try:
+        return float(value.strip())
+    except Exception:
+        return default
+
+
 def main():
     setup_logging()
 
-    print("=" * 60)
-    print("      法律条文智能搜索系统 (支持多关键词组合检索)")
-    print("=" * 60)
+    print("=" * 68)
+    print("      法律条文智能搜索系统 (向量组检索版：整句+子句 Max Recall)")
+    print("=" * 68)
 
     # 1. 初始化搜索器
     try:
         print("\n正在初始化搜索器...")
-        print("(系统将在您首次查询时，自动调用大模型从本地法条库寻找并加载适用的法律文件)\n")
+        print("(系统会在首次查询时自动路由并加载相关法律文件)\n")
         searcher = LegalProvisionSearcher()
     except Exception as e:
         print(f"\n[错误] 初始化失败: {e}")
@@ -60,53 +77,64 @@ def main():
     # 2. 交互式主循环
     while True:
         try:
-            print("\n" + "*" * 60)
-            # 提示用户可以输入多个用逗号分割的关键词
+            print("\n" + "*" * 68)
             query = input("请输入搜索关键词 (支持多个，用中/英文逗号分割，输入 'q' 退出): ").strip()
 
-            if query.lower() in ['q', 'quit', 'exit']:
+            if query.lower() in ["q", "quit", "exit"]:
                 print("退出系统，再见！")
                 break
             if not query:
                 continue
 
-            # 提示说明这是最终合并后返回的总数量上限
-            top_k_str = input("请输入期望返回的最终结果数量 (默认 5): ").strip()
-            top_k = int(top_k_str) if top_k_str.isdigit() else 5
+            # top_k: 最终返回数量
+            top_k_str = input("请输入期望返回的最终结果数量 top_k (默认 5): ").strip()
+            top_k = _parse_int(top_k_str, default=5, min_value=1)
 
-            print(f"\n正在分析请求 '{query}'，进行动态路由、快速检索与并发重排，请稍候...\n")
+            # retrieve_k: 初排召回数量（每个关键词）
+            retrieve_k_str = input("请输入初排召回数量 retrieve_k (默认 50): ").strip()
+            retrieve_k = _parse_int(retrieve_k_str, default=50, min_value=1)
 
-            # 3. 调用封装好的搜索器
-            results = searcher.search(query=query, top_k=top_k, score=0)
+            # score: 最低分阈值（通常是 rerank 分）
+            score_str = input("请输入最低相似度阈值 score (默认 0): ").strip()
+            score = _parse_float(score_str, default=0.0)
 
-            # 4. 结构化输出结果
+            print(
+                f"\n正在分析请求 '{query}'，执行：LLM 路由 -> 向量组 Max 初排 -> 整句内容 Rerank...\n"
+            )
+
+            # 3. 调用新搜索器
+            results = searcher.search(
+                query=query,
+                top_k=top_k,
+                retrieve_k=retrieve_k,
+                score=score
+            )
+
+            # 4. 输出结果
             if not results:
                 print("\n未找到相关的法律条文。")
                 continue
 
-            print("\n" + "=" * 50)
-            print(f" 检索完毕，共找到 {len(results)} 条相关法条 (按相似度降序排列)")
-            print("=" * 50)
+            print("\n" + "=" * 56)
+            print(f" 检索完毕，共找到 {len(results)} 条相关法条 (按相似度降序)")
+            print("=" * 56)
 
             for i, item in enumerate(results, 1):
                 print(f"【匹配结果 {i}】")
-                score = item.get('相似度', 0)
-                # 格式化相似度保留4位小数
-                if isinstance(score, (float, int)):
-                    print(f"相似度: {score:.4f}")
+                sim_score = item.get("相似度", 0)
+                if isinstance(sim_score, (float, int)):
+                    print(f"相似度: {sim_score:.4f}")
                 else:
-                    print(f"相似度: {score}")
+                    print(f"相似度: {sim_score}")
 
                 print(f"法条名: {item.get('法条', '未知位置')}")
                 print(f"内  容: {item.get('内容', '无内容')}")
-                print("-" * 50)
+                print("-" * 56)
 
         except KeyboardInterrupt:
-            # 捕获 Ctrl+C，优雅退出
             print("\n\n检测到中断信号，退出系统，再见！")
             break
         except Exception as e:
-            # 捕获搜索过程中的意外错误，防止整个程序崩溃退出
             print(f"\n[错误] 检索过程中发生异常: {e}")
 
 

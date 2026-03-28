@@ -19,11 +19,12 @@ logger = logging.getLogger(__name__)
 
 class LegalProvisionSearcher:
     """
-    法律条文检索器。
-    采用三阶段架构：
-    0. 路由 (Routing): 利用 LLM 动态从给定的本地法条库中选择适用的法律文件并加载。
-    1. 初排 (Recall): 基于本地 Numpy 矩阵计算向量余弦相似度，进行快速召回。
-    2. 精排 (Rerank): 多线程调用外部 Reranker API 对初排结果进行打分重排。
+    法律条文检索器（适配“向量组”结构）。
+    三阶段架构：
+    0. 路由 (Routing): LLM 从本地法律文件中筛选候选文件。
+    1. 初排 (Recall): 对每条法条的“向量组”计算相似度，取 max 作为该法条初排分。
+       - 向量组格式: [整句向量, 子句向量1, 子句向量2, ...]
+    2. 精排 (Rerank): 仍然基于整句文本 content 调用外部 Reranker。
     """
 
     def __init__(
@@ -39,30 +40,32 @@ class LegalProvisionSearcher:
             reranker_base_url: Optional[str] = None,
             reranker_model_name: Optional[str] = None,
             db_dir: Optional[Path] = None,
-            max_cache_size: int = 5  # 最大缓存文件数，防止 OOM
+            max_cache_size: int = 5
     ) -> None:
-        # 懒加载配置，避免导入模块时引发潜在的循环依赖
         self.embedding_dimensions = embedding_dimensions or config.EMBEDDING_DIMENSIONS
         self.db_dir = db_dir or (Path(__file__).resolve().parent.parent / "database" / "legal_provisions")
         self.max_cache_size = max_cache_size
 
-        # 缓存已加载的法律文件数据。使用 OrderedDict 实现 LRU (最近最少使用) 缓存剔除
-        # 结构: {filename: (valid_data, doc_vectors, doc_norms)}
-        self.loaded_laws_cache: OrderedDict[str, Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]] = OrderedDict()
+        # 缓存结构:
+        # {filename: (valid_data, group_max_vectors, group_max_norms, group_ranges)}
+        # - valid_data: 每条法条原始 item（与 group_ranges 一一对应）
+        # - group_max_vectors / group_max_norms: 将所有法条的“向量组”展平成一个大矩阵
+        # - group_ranges: 每条法条在大矩阵中的切片范围 (start, end)
+        self.loaded_laws_cache: OrderedDict[
+            str,
+            Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, List[Tuple[int, int]]]
+        ] = OrderedDict()
 
-        # Reranker 参数
         self.reranker_api_key = reranker_api_key or config.RERANKER_API_KEY
         self.reranker_base_url = reranker_base_url or config.RERANKER_BASE_URL
         self.reranker_model_name = reranker_model_name or config.RERANKER_MODEL_NAME
 
-        # 初始化 HTTP Session 以复用底层 TCP 连接
         self.http_session = requests.Session()
         self.http_session.headers.update({
             "Authorization": f"Bearer {self.reranker_api_key}",
             "Content-Type": "application/json"
         })
 
-        # 初始化 llm 客户端
         self.model = ChatOpenAI(
             base_url=llm_base_url or config.LLM_BASE_URL,
             api_key=llm_api_key or config.LLM_API_KEY,
@@ -75,7 +78,6 @@ class LegalProvisionSearcher:
             }
         )
 
-        # 初始化 Embedding 客户端
         self.embeddings = OpenAIEmbeddings(
             base_url=embedding_base_url or config.EMBEDDING_BASE_URL,
             api_key=embedding_api_key or config.EMBEDDING_API_KEY,
@@ -83,8 +85,41 @@ class LegalProvisionSearcher:
             dimensions=self.embedding_dimensions
         )
 
-    def _load_and_build_index(self, json_path: Path) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
-        """加载指定的 JSON 数据，并将向量转换为 Numpy 矩阵供快速检索"""
+    def _is_single_vector(self, vec: Any) -> bool:
+        """判断是否为单个合法向量。"""
+        return isinstance(vec, list) and len(vec) == self.embedding_dimensions and all(
+            isinstance(x, (int, float)) for x in vec
+        )
+
+    def _normalize_vector_group(self, vec_field: Any) -> List[List[float]]:
+        """
+        将 item['向量'] 统一归一为“向量组”格式:
+        - 旧格式: 单向量 [d] -> [[d]]
+        - 新格式: 向量组 [[d], [d], ...]
+        """
+        if self._is_single_vector(vec_field):
+            return [vec_field]
+
+        if isinstance(vec_field, list):
+            group = []
+            for v in vec_field:
+                if self._is_single_vector(v):
+                    group.append(v)
+            return group
+
+        return []
+
+    def _load_and_build_index(
+            self,
+            json_path: Path
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, List[Tuple[int, int]]]:
+        """
+        加载指定 JSON，并建立适配“向量组”的索引：
+        - valid_data: 有效法条条目
+        - flat_vectors: 所有法条向量组展平后的矩阵 (T, D)
+        - flat_norms: 展平矩阵每行范数 (T,)
+        - group_ranges: 每条法条在 flat_vectors 中对应的 [start, end)
+        """
         if not json_path.exists():
             raise FileNotFoundError(f"数据文件未找到: {json_path}")
 
@@ -98,46 +133,56 @@ class LegalProvisionSearcher:
         if not isinstance(raw_data, list):
             raise ValueError("数据格式错误：期望为扁平化的列表 (List[dict])。")
 
-        valid_data = []
-        vectors = []
+        valid_data: List[Dict[str, Any]] = []
+        flat_vectors_list: List[List[float]] = []
+        group_ranges: List[Tuple[int, int]] = []
 
+        cursor = 0
         for item in raw_data:
-            vec = item.get("向量")
-            if vec and isinstance(vec, list) and len(vec) == self.embedding_dimensions:
-                valid_data.append(item)
-                vectors.append(vec)
+            vec_group = self._normalize_vector_group(item.get("向量"))
+
+            if not vec_group:
+                continue
+
+            start = cursor
+            flat_vectors_list.extend(vec_group)
+            cursor += len(vec_group)
+            end = cursor
+
+            valid_data.append(item)
+            group_ranges.append((start, end))
 
         if not valid_data:
-            logger.warning(f"文件 {json_path} 中未找到符合维度要求的向量数据。")
+            logger.warning(f"文件 {json_path} 中未找到符合维度要求的向量数据（含向量组）。")
 
-        # 转换为 Float32 矩阵以加速计算
-        doc_vectors = np.array(vectors, dtype=np.float32)
-
-        # 预计算所有法条向量的模长 (Norm)
-        if doc_vectors.size > 0:
-            doc_norms = np.linalg.norm(doc_vectors, axis=1)
-            doc_norms[doc_norms == 0] = 1e-9  # 防止除以 0
+        flat_vectors = np.array(flat_vectors_list, dtype=np.float32)
+        if flat_vectors.size > 0:
+            flat_norms = np.linalg.norm(flat_vectors, axis=1)
+            flat_norms[flat_norms == 0] = 1e-9
         else:
-            doc_norms = np.array([])
+            flat_norms = np.array([])
 
-        logger.info(f"成功加载 {json_path.name}: {len(valid_data)} 条向量数据, 耗时 {time.time() - start_time:.2f}s。")
-        return valid_data, doc_vectors, doc_norms
+        logger.info(
+            f"成功加载 {json_path.name}: {len(valid_data)} 条法条, "
+            f"{len(flat_vectors_list)} 个子向量, 耗时 {time.time() - start_time:.2f}s。"
+        )
+        return valid_data, flat_vectors, flat_norms, group_ranges
 
-    def _get_cached_law(self, law_file: str) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray]:
-        """带 LRU 剔除机制的缓存读取"""
+    def _get_cached_law(
+            self,
+            law_file: str
+    ) -> Tuple[List[Dict[str, Any]], np.ndarray, np.ndarray, List[Tuple[int, int]]]:
+        """带 LRU 剔除机制的缓存读取。"""
         if law_file in self.loaded_laws_cache:
-            # 命中缓存，将其移到末尾（标记为最近使用）
             self.loaded_laws_cache.move_to_end(law_file)
             return self.loaded_laws_cache[law_file]
 
-        # 未命中缓存，进行加载
         law_path = self.db_dir / law_file
         data = self._load_and_build_index(law_path)
 
         self.loaded_laws_cache[law_file] = data
         self.loaded_laws_cache.move_to_end(law_file)
 
-        # 如果超出了最大缓存限制，弹出最久未使用的文件以释放内存
         if len(self.loaded_laws_cache) > self.max_cache_size:
             evicted = self.loaded_laws_cache.popitem(last=False)
             logger.info(f"达到缓存上限，已释放最早加载的法律文件: {evicted[0]}")
@@ -145,7 +190,7 @@ class LegalProvisionSearcher:
         return data
 
     def _get_relevant_laws_from_llm(self, query: str) -> List[str]:
-        """调用大模型，根据查询内容动态选择可能相关的法条文件"""
+        """调用大模型，根据查询内容动态选择可能相关的法条文件。"""
         if not self.db_dir.exists():
             logger.warning(f"数据库目录不存在: {self.db_dir}")
             return []
@@ -156,7 +201,7 @@ class LegalProvisionSearcher:
 
         system_prompt = (
             "你是一个法律助理。我将提供一组可用的法律文件名以及用户的查询请求。"
-            "请根据用户的查询，从列表中选出所有可能适用的法律文件名。\n"
+            "请根据用户的查询，从列表中选出所有可��适用的法律文件名。\n"
             "请必须返回 JSON 格式数据，包含一个键 'laws'，其值为你挑选的文件名列表（精确匹配我提供的文件名）。"
         )
 
@@ -172,9 +217,8 @@ class LegalProvisionSearcher:
 
             result_json = json.loads(response.content)
             selected_laws = result_json.get("laws", [])
-
-            # 过滤掉不在列表中的幻觉文件名
             valid_selected = [law for law in selected_laws if law in available_files]
+
             logger.info(f"[LLM路由] 耗时 {cost_time:.2f}s, 针对查询 '{query}' 筛选出的法律文件: {valid_selected}")
             return valid_selected
         except Exception as e:
@@ -182,13 +226,16 @@ class LegalProvisionSearcher:
             return []
 
     def _format_provision(self, item: Dict[str, Any]) -> str:
-        """格式化法条名称"""
+        """格式化法条名称。"""
         keys = ["法律", "编", "编名", "章", "章名", "节", "节名", "条", "款", "项"]
         parts = [str(item.get(k, "")) for k in keys if item.get(k)]
         return " ".join(parts).strip()
 
     def _rerank(self, query: str, candidates: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
-        """调用 Reranker 接口对候选文档进行重排"""
+        """
+        调用 Reranker 接口对候选文档进行重排。
+        注意：这里仍使用 candidates 的整句 content（满足你的要求）。
+        """
         if not candidates:
             return []
 
@@ -225,44 +272,60 @@ class LegalProvisionSearcher:
             return candidates[:top_k]
 
     def search(self, query: str, top_k: int = 10, retrieve_k: int = 50, score: float = 0.0) -> List[Dict[str, Any]]:
-        """执行多关键词混合搜索"""
+        """执行多关键词混合搜索。"""
         total_start = time.time()
         logger.info(f"开始执行检索管道，Query: '{query}'")
 
-        # 1. LLM 路由筛选文件
+        # 1) LLM 路由
         selected_law_files = self._get_relevant_laws_from_llm(query)
         if not selected_law_files:
             logger.warning("没有匹配到相关的法律文件，检索结束。")
             return []
 
-        combined_data = []
-        combined_vectors_list = []
-        combined_norms_list = []
+        combined_data: List[Dict[str, Any]] = []
+        combined_flat_vectors_list: List[np.ndarray] = []
+        combined_flat_norms_list: List[np.ndarray] = []
+        combined_group_ranges: List[Tuple[int, int]] = []  # 全局范围（对应 combined_data）
 
-        # 使用 LRU 缓存加载或获取数据
+        # 用于把每个文件内的局部索引，映射到全局展平矩阵索引
+        global_flat_cursor = 0
+
         for law_file in selected_law_files:
-            v_data, v_vecs, v_norms = self._get_cached_law(law_file)
+            v_data, v_flat_vecs, v_flat_norms, v_group_ranges = self._get_cached_law(law_file)
+
+            if not v_data:
+                continue
+
             combined_data.extend(v_data)
 
-            if v_vecs.size > 0:
-                combined_vectors_list.append(v_vecs)
-                combined_norms_list.append(v_norms)
+            if v_flat_vecs.size > 0:
+                combined_flat_vectors_list.append(v_flat_vecs)
+                combined_flat_norms_list.append(v_flat_norms)
 
-        if not combined_vectors_list:
+                # 将文件内 group_ranges 偏移到全局
+                for s, e in v_group_ranges:
+                    combined_group_ranges.append((s + global_flat_cursor, e + global_flat_cursor))
+
+                global_flat_cursor += v_flat_vecs.shape[0]
+            else:
+                # 正常情况下不会出现（v_data 有值却无向量），做保护
+                combined_group_ranges.extend([(0, 0)] * len(v_data))
+
+        if not combined_flat_vectors_list or not combined_group_ranges:
             return []
 
-        doc_vectors = np.vstack(combined_vectors_list)
-        doc_norms = np.concatenate(combined_norms_list)
+        flat_doc_vectors = np.vstack(combined_flat_vectors_list)   # (T, D)
+        flat_doc_norms = np.concatenate(combined_flat_norms_list)  # (T,)
 
         keywords = [k.strip() for k in re.split(r'[,，]', query) if k.strip()]
         if not keywords:
             return []
 
-        # 2. 向量化阶段
+        # 2) 查询向量化
         embed_start = time.time()
         try:
             query_vecs = self.embeddings.embed_documents(keywords)
-            query_matrix = np.array(query_vecs, dtype=np.float32)
+            query_matrix = np.array(query_vecs, dtype=np.float32)  # (K, D)
             logger.info(f"[向量化] 耗时 {time.time() - embed_start:.2f}s, 成功生成 {len(keywords)} 个关键词向量。")
         except Exception as e:
             logger.error(f"[向量化] 接口调用失败: {e}", exc_info=True)
@@ -271,22 +334,34 @@ class LegalProvisionSearcher:
         query_norms = np.linalg.norm(query_matrix, axis=1)
         query_norms[query_norms == 0] = 1e-9
 
-        # 余弦相似度计算 (初排)
-        sim_matrix = np.dot(query_matrix, doc_vectors.T) / np.outer(query_norms, doc_norms)
+        # 3) 初排：先算关键词 vs 全部子向量，再按每条��条取 max
+        # sim_sub: (K, T)
+        sim_sub = np.dot(query_matrix, flat_doc_vectors.T) / np.outer(query_norms, flat_doc_norms)
 
-        actual_retrieve_k = min(retrieve_k, sim_matrix.shape[1])
-        top_indices = np.argpartition(-sim_matrix, actual_retrieve_k - 1, axis=1)[:, :actual_retrieve_k]
+        # sim_doc: (K, N_docs)  每个元素是“该关键词对该法条向量组的最大相似度”
+        n_docs = len(combined_data)
+        sim_doc = np.full((len(keywords), n_docs), -1.0, dtype=np.float32)
+
+        for doc_idx, (s, e) in enumerate(combined_group_ranges):
+            if s < e:
+                sim_doc[:, doc_idx] = np.max(sim_sub[:, s:e], axis=1)
+
+        actual_retrieve_k = min(retrieve_k, sim_doc.shape[1])
+        if actual_retrieve_k <= 0:
+            return []
+
+        top_indices = np.argpartition(-sim_doc, actual_retrieve_k - 1, axis=1)[:, :actual_retrieve_k]
 
         all_candidates = []
         for i, kw in enumerate(keywords):
             kw_indices = top_indices[i]
-            sorted_kw_indices = kw_indices[np.argsort(-sim_matrix[i, kw_indices])]
+            sorted_kw_indices = kw_indices[np.argsort(-sim_doc[i, kw_indices])]
 
             candidates = [{
-                "score": float(sim_matrix[i, idx]),
-                "content": combined_data[idx].get("内容", ""),
+                "score": float(sim_doc[i, idx]),  # 初排分 = 该法条向量组 max 相似度
+                "content": combined_data[idx].get("内容", ""),  # rerank 用整句内容
                 "raw_item": combined_data[idx]
-            } for idx in sorted_kw_indices if float(sim_matrix[i, idx]) > 0]
+            } for idx in sorted_kw_indices if float(sim_doc[i, idx]) > 0]
 
             all_candidates.append((kw, candidates))
 
@@ -296,7 +371,7 @@ class LegalProvisionSearcher:
             kw, cands = kw_and_cands
             return self._rerank(kw, cands, top_k)
 
-        # 3. 精排阶段 (多线程)
+        # 4) 精排（并发）
         rerank_start = time.time()
         max_workers = min(10, len(keywords))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -312,8 +387,7 @@ class LegalProvisionSearcher:
                         if current_score < score:
                             continue
 
-                        if provision_name not in merged_results or current_score > merged_results[provision_name][
-                            "相似度"]:
+                        if provision_name not in merged_results or current_score > merged_results[provision_name]["相似度"]:
                             merged_results[provision_name] = {
                                 "法条": provision_name,
                                 "内容": res["content"],
@@ -325,7 +399,6 @@ class LegalProvisionSearcher:
 
         logger.info(f"[精排阶段] 多线程 Rerank 耗时 {time.time() - rerank_start:.2f}s。")
 
-        # 结果排序截取
         output = list(merged_results.values())
         output.sort(key=lambda x: x["相似度"], reverse=True)
         final_output = output[:top_k]
